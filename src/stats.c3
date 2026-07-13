@@ -1,11 +1,6 @@
 module dashboard;
 import std::math;
 
-// Real system statistics. On macOS these are plain libSystem calls (Mach
-// host statistics + sysctl + statvfs) declared as externs — no extra
-// libraries to link. Other platforms get a simulated fallback below, so
-// the example still builds and runs everywhere the library does.
-
 struct SystemStats
 {
 	float cpu; // 0..1 — system-wide CPU busy fraction since the last sample
@@ -152,7 +147,147 @@ fn SystemStats sample_stats()
 	return { .cpu = sample_cpu(), .mem = sample_mem(), .disk = sample_disk() };
 }
 
-module dashboard @if(!env::DARWIN);
+module dashboard @if(env::LINUX);
+import std::io;
+import std::math;
+
+// Linux samplers, mirroring the macOS ones above: CPU and memory are parsed
+// straight out of procfs, the disk from a statvfs() call.
+
+extern fn CInt statvfs(ZString path, StatvfsLinux* buf);
+
+// sys/statvfs.h (glibc, 64-bit). Only the first five fields are read; the
+// trailing layout varies across glibc versions, so the generous padding
+// guarantees the real struct always fits and statvfs never writes past us.
+struct StatvfsLinux
+{
+	ulong f_bsize;
+	ulong f_frsize;
+	ulong f_blocks; // total data blocks, in f_frsize units
+	ulong f_bfree; // free blocks
+	ulong f_bavail; // free blocks available to unprivileged users
+	ulong[16] _tail;
+}
+
+struct CpuTicks @private
+{
+	ulong busy;
+	ulong total;
+}
+
+CpuTicks cpu_prev @private;
+
+// Reads a small procfs file into `buffer`, returning the filled slice (empty
+// on error). procfs reports size 0, so file::load_buffer is useless here; a
+// single read is enough — the fields we need sit in the first few lines.
+fn char[] read_proc(String path, char[] buffer) @private
+{
+	File? f = file::open(path, "rb");
+	if (catch f) return {};
+	defer (void)f.close();
+	sz n = f.read(buffer) ?? 0;
+	return buffer[:n];
+}
+
+fn CpuTicks read_cpu_ticks() @private
+{
+	char[512] buf;
+	// The aggregate "cpu" line: label then user nice system idle iowait irq
+	// softirq steal (guest/guest_nice follow but are already folded into
+	// user/nice, so we stop at the first eight to avoid double-counting).
+	Splitter it = ((String)read_proc("/proc/stat", &buf)).tokenize("\n");
+	String? first = it.next();
+	if (catch first) return {};
+	Splitter fields = first.tokenize(" ");
+	if (catch fields.next()) return {}; // skip the "cpu" label
+	ulong total = 0;
+	ulong idle  = 0;
+	usz idx = 0;
+	while (try tok = fields.next())
+	{
+		if (idx >= 8) break;
+		ulong v = tok.to_ulong() ?? 0;
+		total += v;
+		if (idx == 3 || idx == 4) idle += v; // idle + iowait
+		idx++;
+	}
+	return { .busy = total - idle, .total = total };
+}
+
+<*
+ Seeds the CPU tick baseline; call once before the first sample_stats.
+*>
+fn void stats_prime()
+{
+	cpu_prev = read_cpu_ticks();
+}
+
+fn float sample_cpu() @private
+{
+	CpuTicks now = read_cpu_ticks();
+	ulong busy  = now.busy - cpu_prev.busy;
+	ulong total = now.total - cpu_prev.total;
+	cpu_prev    = now;
+	if (total == 0) return 0;
+	return (float)busy / (float)total;
+}
+
+fn ulong parse_meminfo_kb(String line) @private
+{
+	// e.g. "MemTotal:       16333764 kB" — the value is the second token.
+	Splitter it = line.tokenize(" ");
+	if (catch it.next()) return 0; // skip the label
+	String? num = it.next();
+	if (catch num) return 0;
+	return num.to_ulong() ?? 0;
+}
+
+fn float sample_mem() @private
+{
+	char[2048] buf;
+	String info = (String)read_proc("/proc/meminfo", &buf);
+	ulong total = 0;
+	ulong avail = 0;
+	Splitter lines = info.tokenize("\n");
+	while (try line = lines.next())
+	{
+		if (line.starts_with("MemTotal:"))
+		{
+			total = parse_meminfo_kb(line);
+		}
+		else if (line.starts_with("MemAvailable:"))
+		{
+			avail = parse_meminfo_kb(line);
+		}
+	}
+	if (total == 0) return 0;
+	// MemAvailable is the kernel's estimate of memory free for new work; the
+	// remainder is "used" the way a user perceives it (reclaimable cache aside).
+	ulong used = total > avail ? total - avail : 0;
+	return math::clamp((float)used / (float)total, 0.0f, 1.0f);
+}
+
+fn float sample_disk() @private
+{
+	// Prefer /var: it always exists and holds user data. On a normal distro
+	// it lives on the root filesystem (so this equals /); on atomic/immutable
+	// systems (ostree, bootc) "/" is a tiny read-only composefs and /var is
+	// the real writable partition. Fall back to / if /var is unavailable.
+	// Block size cancels out of the ratio, like df's use%.
+	StatvfsLinux s;
+	if (statvfs("/var", &s) != 0 && statvfs("/", &s) != 0) return 0;
+	ulong used  = (ulong)s.f_blocks - s.f_bfree;
+	ulong total = used + s.f_bavail;
+	if (total == 0) return 0;
+	return math::clamp((float)used / (float)total, 0.0f, 1.0f);
+}
+
+fn SystemStats sample_stats()
+{
+	return { .cpu = sample_cpu(), .mem = sample_mem(), .disk = sample_disk() };
+}
+
+module dashboard @if(!env::DARWIN && !env::LINUX);
 import std::math;
 
 // Simulated fallback where the samplers aren't ported: values drift so the
